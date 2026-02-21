@@ -1,16 +1,9 @@
 /**
- * resolver.js — Smart URL resolver
- *
- * FLOW:
- *  1. Parse raw input → detect kind (torrent / direct / needs-resolve)
- *  2. Jika host butuh resolve → call proxy /resolve endpoint
- *  3. Return { playURL, directURL, headers, cookie, referer, provider, ... }
- *
- * FIXES:
- *  - GoFile CDN: butuh cookie accountToken
- *  - MEGA: encrypted, return warning
- *  - PixelDrain: /api/file/{id} + proxy
- *  - Semua host lain: proxy /resolve otomatis
+ * resolver.js — Smart URL resolver (FIXED v2.1)
+ * 
+ * FIX: AbortSignal.timeout → manual AbortController
+ * FIX: Better error logging
+ * FIX: Smarter fallback chain
  */
 
 import {
@@ -25,15 +18,10 @@ import { PixelDrainCache } from "./store.js";
 //  PARSE INPUT
 // ═══════════════════════════════════════
 
-/**
- * Parse user input string → structured object
- * @returns {object|null}
- */
 export function parseInput(raw) {
   let u = (raw || "").trim();
   if (!u) return null;
 
-  // Torrent / Magnet
   if (u.startsWith("magnet:")) {
     return { kind: "torrent", torrentId: u, provider: "Torrent", directURL: u };
   }
@@ -41,7 +29,6 @@ export function parseInput(raw) {
     return { kind: "torrent", torrentId: u, provider: "Torrent", directURL: u };
   }
 
-  // Normalize protocol
   if (!/^https?:\/\//i.test(u) && !u.startsWith("blob:")) {
     u = "https://" + u;
   }
@@ -55,9 +42,6 @@ export function parseInput(raw) {
   };
 }
 
-/**
- * Detect provider name dari URL
- */
 function detectProvider(url) {
   const h = (() => { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } })();
 
@@ -91,29 +75,60 @@ function detectProvider(url) {
 }
 
 // ═══════════════════════════════════════
+//  SAFE FETCH WITH TIMEOUT
+//  (FIX: AbortSignal.timeout tidak didukung semua browser)
+// ═══════════════════════════════════════
+
+function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  return fetch(url, {
+    ...opts,
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timer));
+}
+
+// ═══════════════════════════════════════
 //  RESOLVE VIA PROXY
 // ═══════════════════════════════════════
 
-/**
- * Call proxy /resolve?url=... endpoint
- * @returns {object|null} { url, referer, origin, cookie, headers, note, filename, filesize }
- */
 async function callResolve(url) {
-  if (!PROXY_URL) return null;
+  if (!PROXY_URL) {
+    console.warn("[resolver] No PROXY_URL configured");
+    return null;
+  }
 
   const base = PROXY_URL.replace(/\/$/, "");
   const resolveURL = `${base}/resolve?url=${encodeURIComponent(url)}`;
 
-  try {
-    const resp = await fetch(resolveURL, {
-      headers: { "Accept": "application/json" },
-      signal: AbortSignal.timeout(15000),
-    });
+  console.log("[resolver] Calling resolve:", resolveURL);
 
-    if (!resp.ok) return null;
-    const data = await resp.json();
+  try {
+    const resp = await fetchWithTimeout(resolveURL, {
+      headers: { "Accept": "application/json" },
+    }, 15000);
+
+    console.log("[resolver] Resolve response status:", resp.status);
+
+    if (!resp.ok) {
+      console.warn("[resolver] Resolve HTTP error:", resp.status, resp.statusText);
+      return null;
+    }
+
+    const text = await resp.text();
+    console.log("[resolver] Resolve response body:", text.substring(0, 500));
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      console.warn("[resolver] Resolve response is not JSON:", e);
+      return null;
+    }
 
     if (data.resolved && data.url) {
+      console.log("[resolver] ✓ Resolved:", data.url, "| note:", data.note || "—");
       return {
         url: data.url,
         referer: data.referer || null,
@@ -127,10 +142,39 @@ async function callResolve(url) {
       };
     }
 
+    console.warn("[resolver] Resolve returned resolved=false:", data);
     return null;
   } catch (e) {
-    console.warn("Resolve failed:", e);
+    if (e.name === "AbortError") {
+      console.warn("[resolver] Resolve timed out (15s)");
+    } else {
+      console.warn("[resolver] Resolve fetch error:", e);
+    }
     return null;
+  }
+}
+
+// ═══════════════════════════════════════
+//  PROBE URL (check if streamable)
+// ═══════════════════════════════════════
+
+async function probeUrl(url) {
+  try {
+    const resp = await fetchWithTimeout(url, { method: "HEAD" }, 8000);
+    const ct = (resp.headers.get("content-type") || "").toLowerCase();
+    const cl = resp.headers.get("content-length");
+    return {
+      ok: resp.ok,
+      status: resp.status,
+      contentType: ct,
+      contentLength: cl ? parseInt(cl) : null,
+      isMedia: ct.startsWith("video/") || ct.startsWith("audio/") ||
+               ct.includes("octet-stream") || ct.includes("matroska") ||
+               ct.includes("mpegurl") || ct.includes("dash"),
+      isHTML: ct.includes("text/html"),
+    };
+  } catch {
+    return { ok: false, status: 0, contentType: "", isMedia: false, isHTML: false };
   }
 }
 
@@ -138,37 +182,17 @@ async function callResolve(url) {
 //  MAIN RESOLVE FUNCTION
 // ═══════════════════════════════════════
 
-/**
- * Resolve URL → mendapatkan playable URL + metadata
- *
- * @param {string} raw - URL dari user
- * @returns {object} {
- *   kind, provider, url, directURL, playURL,
- *   id, title, needsResolve,
- *   resolvedData, codecInfo, pdMeta,
- *   warning
- * }
- */
 export async function resolveMedia(raw) {
   const parsed = parseInput(raw);
   if (!parsed) return null;
 
-  // Torrent → return langsung
   if (parsed.kind === "torrent") {
     return {
-      kind: "torrent",
-      provider: "Torrent",
-      url: raw,
-      directURL: parsed.directURL,
-      torrentId: parsed.torrentId,
-      playURL: null,
-      id: `tor:${raw}`,
-      title: "Torrent",
-      needsResolve: false,
-      resolvedData: null,
-      codecInfo: null,
-      pdMeta: null,
-      warning: null,
+      kind: "torrent", provider: "Torrent", url: raw,
+      directURL: parsed.directURL, torrentId: parsed.torrentId,
+      playURL: null, id: `tor:${raw}`, title: "Torrent",
+      needsResolve: false, resolvedData: null, codecInfo: null,
+      pdMeta: null, warning: null,
     };
   }
 
@@ -182,6 +206,9 @@ export async function resolveMedia(raw) {
   let pdMeta = null;
   let warning = null;
 
+  console.log("[resolver] ── Resolving:", url);
+  console.log("[resolver] Provider:", parsed.provider, "| needsResolve:", needsResolve);
+
   // ── Step 1: PixelDrain metadata ──
   if (parsed.pdId) {
     try {
@@ -192,68 +219,63 @@ export async function resolveMedia(raw) {
     } catch { pdMeta = null; }
 
     if (pdMeta?.name) title = pdMeta.name;
-
-    // PixelDrain direct API URL
     directURL = `https://pixeldrain.com/api/file/${parsed.pdId}`;
+    console.log("[resolver] PixelDrain ID:", parsed.pdId, "| directURL:", directURL);
   }
 
-  // ── Step 2: Resolve via proxy jika butuh ──
+  // ── Step 2: Resolve via proxy ──
   if (needsResolve) {
+    console.log("[resolver] Host needs resolve, calling proxy...");
     resolvedData = await callResolve(url);
 
     if (resolvedData) {
       directURL = resolvedData.url;
       if (resolvedData.filename) title = resolvedData.filename;
 
-      // MEGA warning
       if (resolvedData.note && resolvedData.note.includes("encrypted")) {
-        warning = "MEGA files are encrypted. Browser tidak bisa play langsung. Gunakan MEGA app atau download dulu.";
+        warning = "MEGA files are AES encrypted. Browser tidak bisa play langsung. Download file dengan MEGA app lalu putar dengan VLC.";
       }
+    } else {
+      console.warn("[resolver] Resolve returned null — will try proxy streaming directly");
     }
   }
 
   // ── Step 3: Build play URL ──
-  if (resolvedData && resolvedData.cookie) {
-    // Harus lewat proxy karena butuh cookie/headers
+  // Strategi: SELALU proxy untuk host yang butuh resolve
+  // Untuk direct URL, coba langsung dulu
+  if (needsResolve || parsed.pdId) {
     playURL = buildProxy(directURL);
-  } else if (needsResolve) {
-    // Selalu proxy untuk host yang butuh resolve
-    playURL = buildProxy(directURL);
+    console.log("[resolver] Play via proxy:", playURL);
   } else if (isHLSUrl(directURL)) {
-    // HLS selalu proxy untuk rewrite
     playURL = buildProxy(directURL);
+    console.log("[resolver] HLS via proxy:", playURL);
   } else {
-    // Direct URL — coba tanpa proxy dulu, fallback ke proxy
     playURL = directURL;
+    console.log("[resolver] Play direct:", playURL);
   }
 
   // ── Step 4: Codec detection ──
   const mimeType = pdMeta?.type || null;
   const codecInfo = detectCodecSupport(directURL, mimeType);
 
-  // Tambahan warning dari codec detection
   if (codecInfo.warning && !warning) {
     warning = codecInfo.warning;
   }
 
-  // Update title dari filename jika ada
   if (resolvedData?.filename) title = resolvedData.filename;
   if (pdMeta?.name) title = pdMeta.name;
 
+  console.log("[resolver] ── Result:", {
+    title, provider: parsed.provider, directURL, playURL,
+    codec: codecInfo?.codec, container: codecInfo?.container,
+    canPlay: codecInfo?.canPlay, warning,
+  });
+
   return {
-    kind: "url",
-    provider: parsed.provider,
-    url: raw,
-    directURL,
-    playURL,
-    id: `url:${directURL}`,
-    title,
-    needsResolve,
-    resolvedData,
-    codecInfo,
-    pdMeta,
-    pdId: parsed.pdId || null,
-    warning,
+    kind: "url", provider: parsed.provider, url: raw,
+    directURL, playURL, id: `url:${directURL}`, title,
+    needsResolve, resolvedData, codecInfo, pdMeta,
+    pdId: parsed.pdId || null, warning,
   };
 }
 
@@ -261,18 +283,13 @@ export async function resolveMedia(raw) {
 //  RANGE SUPPORT DETECTION
 // ═══════════════════════════════════════
 
-/**
- * Detect apakah server support byte-range (untuk seek)
- * @returns {boolean|null} true/false/null(unknown)
- */
 export async function detectRangeSupport(url) {
   try {
-    const resp = await fetch(url, {
+    const resp = await fetchWithTimeout(url, {
       method: "GET",
       headers: { Range: "bytes=0-0" },
-      signal: AbortSignal.timeout(5000),
       cache: "no-store",
-    });
+    }, 5000);
 
     if (resp.status === 206) return true;
     const ar = (resp.headers.get("accept-ranges") || "").toLowerCase();
@@ -285,59 +302,81 @@ export async function detectRangeSupport(url) {
 
 // ═══════════════════════════════════════
 //  MULTI-SOURCE FALLBACK CHAIN
+//  🔑 FIX: Better logging + probe before load
 // ═══════════════════════════════════════
 
-/**
- * Coba load video dari beberapa URL secara berurutan.
- * Ini FIX utama: jika URL pertama gagal, coba proxy, coba direct, dll.
- *
- * @param {HTMLVideoElement} videoEl
- * @param {object} mediaInfo - dari resolveMedia()
- * @returns {{ success: boolean, usedUrl: string, error?: string }}
- */
 export async function tryLoadWithFallback(videoEl, mediaInfo) {
-  // Bangun chain URL yang akan dicoba
   const urls = [];
-  const { playURL, directURL, resolvedData } = mediaInfo;
+  const { playURL, directURL } = mediaInfo;
 
-  // 1. Primary play URL
-  if (playURL) urls.push(playURL);
+  // 1. Primary play URL (biasanya proxied)
+  if (playURL) urls.push({ url: playURL, label: "proxy" });
 
-  // 2. Direct URL tanpa proxy (jika beda dari playURL)
-  if (directURL && directURL !== playURL) urls.push(directURL);
-
-  // 3. Direct URL via proxy (jika belum ada di list)
-  const proxied = buildProxy(directURL);
-  if (!urls.includes(proxied)) urls.push(proxied);
-
-  // 4. Original URL via proxy (jika beda)
-  if (mediaInfo.url !== directURL) {
-    const proxiedOrig = buildProxy(mediaInfo.url);
-    if (!urls.includes(proxiedOrig)) urls.push(proxiedOrig);
+  // 2. Direct URL tanpa proxy (jika beda)
+  if (directURL && directURL !== playURL) {
+    urls.push({ url: directURL, label: "direct" });
   }
 
-  // Coba satu per satu
-  for (let i = 0; i < urls.length; i++) {
-    const url = urls[i];
-    const success = await _tryLoadSingle(videoEl, url);
+  // 3. Direct URL via proxy (jika belum ada)
+  const proxied = buildProxy(directURL);
+  if (!urls.find(u => u.url === proxied)) {
+    urls.push({ url: proxied, label: "proxy-fallback" });
+  }
 
-    if (success) {
-      return { success: true, usedUrl: url, tryIndex: i };
+  // 4. Original URL via proxy (jika beda dari directURL)
+  if (mediaInfo.url !== directURL) {
+    const proxiedOrig = buildProxy(mediaInfo.url);
+    if (!urls.find(u => u.url === proxiedOrig)) {
+      urls.push({ url: proxiedOrig, label: "proxy-original" });
     }
   }
 
+  console.log("[loader] ── Trying", urls.length, "URLs:");
+  urls.forEach((u, i) => console.log(`  [${i}] ${u.label}: ${u.url.substring(0, 120)}...`));
+
+  const errors = [];
+
+  for (let i = 0; i < urls.length; i++) {
+    const { url, label } = urls[i];
+    console.log(`[loader] Attempt ${i + 1}/${urls.length} (${label})...`);
+
+    const success = await _tryLoadSingle(videoEl, url);
+
+    if (success) {
+      console.log(`[loader] ✓ Success with ${label}`);
+      return { success: true, usedUrl: url, tryIndex: i, label };
+    }
+
+    // Log kenapa gagal
+    const errCode = videoEl.error?.code;
+    const errMsg = videoEl.error?.message || "";
+    const errDetail = `${label}: error code=${errCode} msg="${errMsg}"`;
+    errors.push(errDetail);
+    console.warn(`[loader] ✗ Failed ${label}:`, errDetail);
+  }
+
+  // Semua gagal — build detailed error
+  const codecInfo = mediaInfo.codecInfo;
+  let errorMsg = "Semua URL gagal dimuat.\n\n";
+
+  if (codecInfo && !codecInfo.canPlay) {
+    errorMsg += `Format: ${codecInfo.container} / ${codecInfo.codec}\n`;
+    errorMsg += codecInfo.warning + "\n\n";
+  }
+
+  errorMsg += "Detail error:\n" + errors.join("\n") + "\n\n";
+  errorMsg += "Gunakan tombol Download untuk download file, lalu putar dengan VLC.";
+
+  console.error("[loader] ── All URLs failed:", errors);
+
   return {
     success: false,
-    usedUrl: urls[0],
-    error: "Semua URL gagal dimuat. Periksa link atau coba download langsung."
+    usedUrl: urls[0]?.url || "",
+    error: errorMsg,
   };
 }
 
-/**
- * Coba load single URL ke video element
- * @returns {Promise<boolean>}
- */
-function _tryLoadSingle(videoEl, url, timeout = 18000) {
+function _tryLoadSingle(videoEl, url, timeout = 20000) {
   return new Promise(resolve => {
     let done = false;
     const ok = () => { if (done) return; done = true; cleanup(); resolve(true); };
@@ -346,45 +385,40 @@ function _tryLoadSingle(videoEl, url, timeout = 18000) {
     const cleanup = () => {
       videoEl.removeEventListener("canplay", ok);
       videoEl.removeEventListener("loadeddata", ok);
+      videoEl.removeEventListener("loadedmetadata", ok);
       videoEl.removeEventListener("error", no);
       clearTimeout(tmr);
     };
 
+    // Listen for multiple success signals
     videoEl.addEventListener("canplay", ok, { once: true });
     videoEl.addEventListener("loadeddata", ok, { once: true });
+    videoEl.addEventListener("loadedmetadata", ok, { once: true });
     videoEl.addEventListener("error", no, { once: true });
 
     try {
       videoEl.src = url;
       videoEl.load();
-    } catch {
+    } catch (e) {
+      console.warn("[loader] Exception setting src:", e);
       no();
       return;
     }
 
-    const tmr = setTimeout(no, timeout);
+    const tmr = setTimeout(() => {
+      console.warn("[loader] Timeout after", timeout, "ms for:", url.substring(0, 80));
+      no();
+    }, timeout);
   });
 }
 
 // ═══════════════════════════════════════
-//  EXPORT UTILITIES
+//  DOWNLOAD URL
 // ═══════════════════════════════════════
 
-/**
- * Build download URL — prefer direct, fallback proxy
- */
 export function getDownloadUrl(mediaInfo) {
   if (!mediaInfo) return null;
-
-  // Jika ada resolved URL
-  if (mediaInfo.resolvedData?.url) {
-    return buildProxy(mediaInfo.resolvedData.url);
-  }
-
-  // Direct URL
-  if (mediaInfo.directURL) {
-    return buildProxy(mediaInfo.directURL);
-  }
-
+  if (mediaInfo.resolvedData?.url) return buildProxy(mediaInfo.resolvedData.url);
+  if (mediaInfo.directURL) return buildProxy(mediaInfo.directURL);
   return buildProxy(mediaInfo.url);
 }
