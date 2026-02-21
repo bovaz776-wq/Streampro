@@ -1,9 +1,10 @@
 /**
- * keyboard.js — Keyboard shortcuts & Command Palette
+ * keyboard.js — Keyboard shortcuts & Command Palette (FIXED v2.1)
+ * FIX: require() → proper import
  */
 
 import { $, $$, clamp, escHTML, isInputFocused } from "./config.js";
-import { Settings } from "./store.js";
+import { Settings, Queue } from "./store.js";  // ← FIX: import Queue properly
 import * as Player from "./player.js";
 import { toggleEQ, resetEQ, resetVisual } from "./effects.js";
 import { toast, showActionIndicator, revealControls, updateVolIcon } from "./ui.js";
@@ -42,8 +43,9 @@ function buildCmds() {
 
   add("Add to Queue", "+queue", () => Player.addCurrentToQueue());
   add("Play Next from Queue", "next", () => Player.playNextFromQueue());
+
+  // ← FIX: langsung pakai imported Queue, bukan require()
   add("Clear Queue", "clear", () => {
-    const { Queue } = require("./store.js");
     Queue.clear();
     toast("Queue cleared", "ok");
   });
@@ -142,26 +144,17 @@ function runCmdSel() {
 // ═══════════════════════════════════════
 
 function onKeyDown(e) {
-  // ── Command palette open ──
   if ($("#cmd").classList.contains("open")) {
     if (e.key === "Escape") { e.preventDefault(); closeCmd(); }
-    // Arrow / Enter handled by cmdIn keydown below
     return;
   }
 
-  // ── Input focused → ignore most keys ──
   if (isInputFocused(e.target)) return;
 
   const k = (e.key || "").toLowerCase();
 
-  // Ctrl/Cmd + K → open command palette
-  if ((e.ctrlKey || e.metaKey) && k === "k") {
-    e.preventDefault();
-    openCmd();
-    return;
-  }
+  if ((e.ctrlKey || e.metaKey) && k === "k") { e.preventDefault(); openCmd(); return; }
 
-  // Escape → close modals
   if (e.key === "Escape") {
     if ($("#torModal").classList.contains("open")) {
       e.preventDefault();
@@ -172,23 +165,11 @@ function onKeyDown(e) {
 
   const v = Player.getVideo();
 
-  // Space → play/pause
-  if (e.code === "Space") {
-    e.preventDefault();
-    Player.togglePlay();
-    return;
-  }
-
-  // J / ArrowLeft → back 10s
+  if (e.code === "Space") { e.preventDefault(); Player.togglePlay(); return; }
   if (k === "j" || e.key === "ArrowLeft") { e.preventDefault(); Player.skip(-10); return; }
-
-  // L / ArrowRight → forward 10s
   if (k === "l" || e.key === "ArrowRight") { e.preventDefault(); Player.skip(10); return; }
-
-  // F → fullscreen
   if (k === "f") { e.preventDefault(); Player.toggleFullscreen(); return; }
 
-  // M → mute
   if (k === "m") {
     e.preventDefault();
     v.muted = !v.muted;
@@ -199,19 +180,11 @@ function onKeyDown(e) {
     return;
   }
 
-  // B → bookmark
   if (k === "b") { e.preventDefault(); Player.addBookmark(); return; }
-
-  // A → A/B loop
   if (k === "a") { e.preventDefault(); Player.toggleAB(); return; }
-
-  // P → screenshot
   if (k === "p") { e.preventDefault(); Player.screenshot(); return; }
-
-  // S → subtitle
   if (k === "s") { e.preventDefault(); $("#subIn").click(); return; }
 
-  // ArrowUp → volume up
   if (e.key === "ArrowUp") {
     e.preventDefault();
     v.volume = clamp(v.volume + 0.05, 0, 1);
@@ -221,7 +194,6 @@ function onKeyDown(e) {
     return;
   }
 
-  // ArrowDown → volume down
   if (e.key === "ArrowDown") {
     e.preventDefault();
     v.volume = clamp(v.volume - 0.05, 0, 1);
@@ -230,35 +202,12 @@ function onKeyDown(e) {
     return;
   }
 
-  // , / . → frame step
-  if (k === "," && isFinite(v.duration)) {
-    e.preventDefault();
-    v.currentTime = clamp(v.currentTime - (1 / 30), 0, v.duration);
-    return;
-  }
-  if (k === "." && isFinite(v.duration)) {
-    e.preventDefault();
-    v.currentTime = clamp(v.currentTime + (1 / 30), 0, v.duration);
-    return;
-  }
+  if (k === "," && isFinite(v.duration)) { e.preventDefault(); v.currentTime = clamp(v.currentTime - (1/30), 0, v.duration); return; }
+  if (k === "." && isFinite(v.duration)) { e.preventDefault(); v.currentTime = clamp(v.currentTime + (1/30), 0, v.duration); return; }
 
-  // [ / ] → speed
-  if (k === "[") {
-    e.preventDefault();
-    v.playbackRate = clamp(v.playbackRate - 0.25, 0.25, 4);
-    Settings.save({ rate: v.playbackRate });
-    toast("Speed: " + v.playbackRate.toFixed(2) + "×", "ok");
-    return;
-  }
-  if (k === "]") {
-    e.preventDefault();
-    v.playbackRate = clamp(v.playbackRate + 0.25, 0.25, 4);
-    Settings.save({ rate: v.playbackRate });
-    toast("Speed: " + v.playbackRate.toFixed(2) + "×", "ok");
-    return;
-  }
+  if (k === "[") { e.preventDefault(); v.playbackRate = clamp(v.playbackRate - 0.25, 0.25, 4); Settings.save({ rate: v.playbackRate }); toast("Speed: " + v.playbackRate.toFixed(2) + "×", "ok"); return; }
+  if (k === "]") { e.preventDefault(); v.playbackRate = clamp(v.playbackRate + 0.25, 0.25, 4); Settings.save({ rate: v.playbackRate }); toast("Speed: " + v.playbackRate.toFixed(2) + "×", "ok"); return; }
 
-  // 0-9 → seek to percentage
   if (/^[0-9]$/.test(k) && isFinite(v.duration)) {
     e.preventDefault();
     const pct = parseInt(k, 10) / 10;
@@ -274,7 +223,6 @@ function onKeyDown(e) {
 export function initKeyboard() {
   document.addEventListener("keydown", onKeyDown, { capture: true });
 
-  // Command palette UI
   $("#cmdBtn")?.addEventListener("click", openCmd);
   $("#cmdClose")?.addEventListener("click", closeCmd);
   $("#cmd")?.addEventListener("click", e => { if (e.target.id === "cmd") closeCmd(); });
